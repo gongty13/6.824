@@ -66,6 +66,7 @@ func (h *OpHeap) Pop() interface{} {
 
 type KVServer struct {
 	mu        sync.Mutex
+	mu_map    sync.Mutex
 	me        int
 	rf        *raft.Raft
 	applyCh   chan raft.ApplyMsg
@@ -88,17 +89,30 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if isLeader {
 		reply.WrongLeader = false
 		op := Op{Type: OpGet, Key: args.Key, Value: "", Id: args.RequestId, Cid: args.ClientId}
-		if _, ok := kv.opCount[args.ClientId]; !ok {
-			kv.opCount[args.ClientId] = 0
+		if v, ok := kv.opCount[args.ClientId]; !ok || op.Id > v {
+			kv.mu_map.Lock()
+			kv.opCount[args.ClientId] = op.Id
+			kv.mu_map.Unlock()
+			index, term, isLeader := kv.rf.Start(op)
+			DPrintln("start", kv.me, index, term, isLeader)
+			if !isLeader {
+				reply.WrongLeader = true
+				kv.mu_map.Lock()
+				kv.opCount[args.ClientId] = op.Id - 1
+				kv.mu_map.Unlock()
+				DPrintln("not leader any more", kv.me, kv.rf.Detail())
+				return
+			}
 		}
-		kv.rf.Start(op)
-		//println(kv.maxCommit, kv.me, kv.rf.Info(), "getting")
+		//time.Sleep(50*time.Millisecond)
+		DPrintln("commitI", kv.maxCommit, "me", kv.me, kv.rf.Info(), kv.rf.Detail(), kv.opCount[args.ClientId], op.Id, args.ClientId)
 		for kv.maxCommit < kv.rf.Info()+kv.rf.CommandNumInSnap-kv.rf.FakeCommandNumInSnap {
 			//DPrintln("commit and Info", kv.maxCommit, kv.rf.Info(), kv.rf.CommandNumInSnap, kv.rf.FakeCommandNumInSnap)
 			time.Sleep(time.Millisecond)
 			_, isLeader = kv.rf.GetState()
 			if !isLeader {
 				reply.WrongLeader = true
+				DPrintln("not leader any more", kv.me, kv.rf.Detail())
 				return
 			}
 		}
@@ -110,10 +124,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		} else {
 			reply.Err = ErrNoKey
 		}
-		//println(kv.maxCommit, kv.me, kv.rf.Info(), "getting")
-
+		DPrintln("mcommit", kv.maxCommit, "me", kv.me, "cmdnum", kv.rf.Info(), reply.WrongLeader, op.Id, op.Cid, kv.rf.Detail())
 		if kv.maxraftstate != -1 && kv.rf.StateSize() >= kv.maxraftstate {
-			kv.rf.PrepareSnapShot(kv.data)
+			kv.rf.PrepareSnapShot(kv.data, kv.commitOp)
 		}
 	} else {
 		reply.WrongLeader = true
@@ -139,26 +152,39 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if args.Op == "Put" {
 			op.Type = OpPut
 		}
-		if _, ok := kv.opCount[args.ClientId]; !ok {
-			kv.opCount[args.ClientId] = 0
-		}
-		if op.Id > kv.opCount[args.ClientId] {
-			kv.rf.Start(op)
+		if v, ok := kv.opCount[args.ClientId]; !ok || op.Id > v {
+			kv.mu_map.Lock()
 			kv.opCount[args.ClientId] = op.Id
+			kv.mu_map.Unlock()
+			index, term, isLeader := kv.rf.Start(op)
+			DPrintln("start", kv.me, index, term, isLeader, op.Id, op.Cid)
+			if !isLeader {
+				reply.WrongLeader = true
+				kv.mu_map.Lock()
+				kv.opCount[args.ClientId] = op.Id - 1
+				kv.mu_map.Unlock()
+				DPrintln("not leader any more", kv.me, kv.rf.Detail())
+				return
+			}
 		}
-		DPrintln("commit and Info", kv.maxCommit, kv.rf.Info(), kv.rf.CommandNumInSnap, kv.rf.FakeCommandNumInSnap, kv.opCount[args.ClientId])
+		//kv.mu_map.Unlock()
+		DPrintln("commitI", kv.maxCommit, "me", kv.me, kv.rf.Info(), kv.rf.Detail(), kv.opCount[args.ClientId], op.Id, args.ClientId)
 		for kv.maxCommit < kv.rf.Info()+kv.rf.CommandNumInSnap-kv.rf.FakeCommandNumInSnap {
 			//DPrintln("commit and Info", kv.maxCommit, kv.rf.Info(), kv.rf.CommandNumInSnap, kv.rf.FakeCommandNumInSnap)
 			time.Sleep(time.Millisecond)
 			_, isLeader = kv.rf.GetState()
 			if !isLeader {
 				reply.WrongLeader = true
+				kv.mu_map.Lock()
+				kv.opCount[args.ClientId] = op.Id - 1
+				kv.mu_map.Unlock()
+				DPrintln("not leader any more", kv.me, kv.rf.Detail())
 				return
 			}
 		}
-		DPrintln("mcommit", kv.maxCommit, "me", kv.me, "cmdnum", kv.rf.Info(), reply.WrongLeader, op.Id, op.Cid)
+		DPrintln("mcommit", kv.maxCommit, "me", kv.me, "cmdnum", kv.rf.Info(), reply.WrongLeader, op.Id, op.Cid, kv.rf.Detail())
 		if kv.maxraftstate != -1 && kv.rf.StateSize() >= kv.maxraftstate {
-			kv.rf.PrepareSnapShot(kv.data)
+			kv.rf.PrepareSnapShot(kv.data, kv.commitOp)
 		}
 	} else {
 		reply.WrongLeader = true
@@ -206,6 +232,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
+	kv.commitOp = make(map[int64]int)
 	kv.maxCommit = -1
 	go func() {
 		for msg := range kv.applyCh {
@@ -215,8 +242,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	r := bytes.NewBuffer(persister.ReadSnapshot())
 	e := labgob.NewDecoder(r)
 	e.Decode(&kv.data)
+	e.Decode(&kv.commitOp)
 	kv.opCount = make(map[int64]int)
-	kv.commitOp = make(map[int64]int)
 	kv.persister = persister
 	return kv
 }
@@ -234,6 +261,7 @@ func (kv *KVServer) apply(msg *raft.ApplyMsg) {
 		r := bytes.NewBuffer(kv.persister.ReadSnapshot())
 		e := labgob.NewDecoder(r)
 		e.Decode(&kv.data)
+		e.Decode(&kv.commitOp)
 	}
 	if opc, ok := kv.commitOp[op.Cid]; !ok || opc < op.Id {
 		kv.commitOp[op.Cid] = op.Id
@@ -253,8 +281,10 @@ func (kv *KVServer) apply(msg *raft.ApplyMsg) {
 	//default:
 	//}
 	kv.maxCommit = msg.CommandIndex
+	kv.mu_map.Lock()
 	if kv.opCount[op.Cid] < op.Id {
 		kv.opCount[op.Cid] = op.Id
 	}
+	kv.mu_map.Unlock()
 
 }
